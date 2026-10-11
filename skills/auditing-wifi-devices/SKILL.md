@@ -7,6 +7,7 @@ slug: auditing-wifi-devices
 displayName: 局域网设备审计
 summary: 扫描局域网与 WiFi 接入设备，用 MAC 厂商、SSDP/mDNS 服务自报与端口指纹识别设备类型，建立台账做前后差分，定位陌生设备与新增设备。
 author: johnsmithCA-sta
+homepage: https://github.com/johnsmithCA-sta/auditing-wifi-devices
 ---
 
 # 局域网设备审计
