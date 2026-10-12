@@ -9,7 +9,10 @@
     python3 lan_scan.py --db ./my-net.db                    # 指定台账；默认按网段分库
     python3 lan_scan.py --ssdp-listen 40                    # 延长 SSDP 监听(默认 30s)
     python3 lan_scan.py --online-vendor                      # 允许联网查厂商（默认关闭）
-    python3 lan_scan.py --oui-file /path/oui.txt            # 指定 IEEE OUI 库
+    python3 lan_scan.py --oui-file a --oui-file b           # 指定 OUI 库（可多个）
+    python3 fetch_oui.py                                    # 一键获取 Wireshark manuf 厂商库
+OUI 库不指定时自动使用运行目录 oui-vendors/ 缓存（manuf / oui.csv / mam.csv / oui36.csv，
+OUI_CACHE_DIR 可改位置）。
 
 退出码: 0 成功 / 2 参数或环境错误
 """
@@ -111,13 +114,23 @@ def discover_hosts(subnet):
         # 无 fping 时用 ping 兜底，仅抽样前 254 个地址
         for host in list(net.hosts())[:254]:
             run(f"ping -c 1 -W 1 {host}", timeout=3)
-    # 2) 读 ARP
-    return parse_arp()
+    # 2) 读 ARP（只保留目标网段内的条目——ARP 表会因历史通信残留其他网段的记录，
+    #    显式 --subnet 缩范围时必须守住，否则扫描范围形同虚设）
+    net = ipaddress.ip_network(subnet)
+    return {ip: mac for ip, mac in parse_arp().items()
+            if ipaddress.ip_address(ip) in net}
 
 
 def parse_arp():
-    """解析 arp -a，兼容 macOS 与 Linux 输出格式。"""
-    out = run("arp -a")
+    """解析 arp 表，兼容 macOS 与 Linux 输出格式。
+
+    必须带 -n：macOS 的 `arp -a` 会对每个条目做反向 DNS 解析，DNS 不可达
+    （黑洞 / 沙箱 / 无外网）时整个命令无限挂起，ARP 判活随之静默归零、
+    报告输出 0 台设备。`-n` 跳过域名解析只出数字，Linux arp 同样支持。
+    """
+    out = run("arp -an")
+    if not out.strip():
+        out = run("ip neigh show 2>/dev/null")  # 无 arp 二进制的系统
     table = {}
     mac_re = re.compile(r"(?:[0-9a-f]{1,2}:){5}[0-9a-f]{1,2}", re.I)
     for line in out.splitlines():
@@ -132,11 +145,14 @@ def parse_arp():
         m_mac = mac_re.search(line)
         if m_mac:
             table[ip] = m_mac.group(0).lower()
-    # 去掉广播与组播（224.0.0.0–239.255.255.255 不是真实设备）
+    # 去掉广播与组播（224.0.0.0–239.255.255.255 不是真实设备）；
+    # 链路本地（169.254.0.0/16, APIPA）不可路由，且常与同一网卡的路由地址
+    # 并存（同 MAC 两条记录），入清单只会造成重复
     keep = {}
     for ip, mac in table.items():
         try:
-            if ipaddress.ip_address(ip).is_multicast or ip.endswith(".255"):
+            addr = ipaddress.ip_address(ip)
+            if addr.is_multicast or addr.is_link_local or ip.endswith(".255"):
                 continue
         except Exception:
             continue
@@ -148,7 +164,7 @@ def parse_arp():
 def sniff_ssdp(seconds=30):
     """被动监听 SSDP/UPnP 广播。返回 {ip: {'server':..,'nt':..,'location':..}}。
 
-    这是识别 IoT 性价比最高的手段：设备会自报 SERVER 与设备类型。
+    这是识别 IoT 的高性价比手段：设备会自报 SERVER 与设备类型。
     """
     import struct
     result = {}
@@ -198,9 +214,12 @@ def browse_mdns(per_service=3):
     """浏览常见 mDNS 服务，收集设备自报实例名。
 
     实例名无法直接反查 IP（需额外 -L/-G 两步），故只作为辅助佐证列出。
+    当前只实现 macOS 的 dns-sd；Linux 上即使装有 avahi-browse 也未接解析，
+    明确提示跳过而不是静默返回空。
     """
     names = set()
-    if sys.platform != "darwin" and not run("command -v avahi-browse").strip():
+    if sys.platform != "darwin":
+        sys.stderr.write("      跳过 mDNS 浏览（当前仅 macOS 的 dns-sd 可用）\n")
         return {}
     for svc in MDNS_SERVICES:
         try:
@@ -237,26 +256,103 @@ def is_random_mac(mac):
     return bool(first & 0x02)
 
 
-def load_oui(path):
-    """加载 IEEE OUI 库（oui.txt 或 oui.csv）。返回 {前缀6位: 厂商名}。"""
+def _norm_prefix(raw, mask=None):
+    """把各种写法的前缀归一成 6/7/9 位 hex；非法返回 ''。
+
+    兼容：00:1B:C5 / 00-1B-C5 / 001BC5 / 00:1B:C5:00/28 / 00:1B:C5:00:00/36
+    （后两种是 Wireshark manuf 的「完整地址+掩码」写法，按掩码位宽截断：
+    /28 → 前 7 位 hex，/36 → 前 9 位 hex）。
+    """
+    if mask is not None:
+        try:
+            bits = int(mask)
+            hexs = re.sub(r"[^0-9A-Fa-f]", "", raw).upper()[:bits // 4]
+            return hexs if len(hexs) in (6, 7, 9) else ""
+        except ValueError:
+            pass
+    hexs = re.sub(r"[^0-9A-Fa-f]", "", raw).upper()
+    return hexs if len(hexs) in (6, 7, 9) else ""
+
+
+def oui_cache_dir():
+    """OUI 厂商库缓存目录：默认运行目录下的 oui-vendors/，OUI_CACHE_DIR 可覆盖。
+
+    刻意不用绝对路径作默认值——技能要能在任何机器、任何 harness 下运行，
+    不假设本机存在某个特定目录。与台账库默认落运行目录保持同一惯例。
+    """
+    return os.environ.get("OUI_CACHE_DIR") or os.path.join(".", "oui-vendors")
+
+
+def load_oui(paths):
+    """加载 OUI 厂商库，返回 {前缀hex: 厂商名}。按行嗅探格式，不靠扩展名。
+
+    支持三种社区格式（可多文件合并，先加载者优先，不互相覆盖）：
+      · Wireshark manuf —— TSV 三列（前缀 \\t 短名 \\t 全名/注释），# 注释，
+        前缀可带 /28 /36 掩码；约 5.8 万条，合并 IEEE 三表 + IAB + 社区清单，
+        社区主流单文件来源。
+      · IEEE oui.txt / mam.txt / oui36.txt —— "(base 16)" 行式。
+      · IEEE CSV —— Registry, Assignment, Organization, Address 四列
+        （standards-oui.ieee.org 的 oui.csv / mam.csv / oui36.csv）。
+
+    前缀长度含义：6 hex = 24 位（MA-L/OUI）、7 hex = 28 位（MA-M）、
+    9 hex = 36 位（MA-S）。查找见 lookup_oui（最长前缀优先）。
+    """
+    if isinstance(paths, str):
+        paths = [paths]
     table = {}
-    if not path or not os.path.isfile(path):
-        return table
-    try:
-        with open(path, encoding="utf8", errors="ignore") as f:
-            for line in f:
-                if "(base 16)" in line:
-                    m = re.match(r"^([0-9A-F]{2}-[0-9A-F]{2}-[0-9A-F]{2})\s+\(base 16\)\s+(.+)$",
-                                 line.strip(), re.I)
-                    if m:
-                        table[m.group(1).replace("-", "").upper()] = m.group(2).strip()
-                elif path.lower().endswith(".csv"):
-                    parts = line.split(",")
-                    if len(parts) >= 3 and re.match(r"^[0-9A-F]{6}$", parts[1].strip(), re.I):
-                        table[parts[1].strip().upper()] = parts[2].strip().strip('"')
-    except Exception:
-        pass
+    for path in paths or []:
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf8", errors="ignore") as f:
+                for line in f:
+                    line = line.rstrip("\n")
+                    if not line.strip() or line.lstrip().startswith("#"):
+                        continue
+                    if "(base 16)" in line:  # IEEE txt
+                        m = re.match(
+                            r"^\s*([0-9A-F]{2}[-:][0-9A-F]{2}[-:][0-9A-F]{2}(?:[-:][0-9A-F]{1,2})?"
+                            r"(?:[-:][0-9A-F]{1,2})?)\s+\(base 16\)\s+(.+)$", line, re.I)
+                        if m:
+                            p = _norm_prefix(m.group(1))
+                            if p:
+                                table.setdefault(p, m.group(2).strip())
+                        continue
+                    if "\t" in line:  # Wireshark manuf
+                        parts = line.split("\t")
+                        if len(parts) >= 2:
+                            raw, mask = parts[0].strip(), None
+                            if "/" in raw:
+                                raw, mask = raw.split("/", 1)
+                            p = _norm_prefix(raw, mask)
+                            if p:
+                                name = parts[2].strip() if len(parts) > 2 else ""
+                                table.setdefault(p, name or parts[1].strip())
+                        continue
+                    if "," in line:  # IEEE CSV
+                        parts = line.split(",")
+                        if len(parts) >= 3 and re.match(
+                                r"^[0-9A-F]{6,9}$", parts[1].strip(), re.I):
+                            p = _norm_prefix(parts[1].strip())
+                            if p:
+                                table.setdefault(
+                                    p, parts[2].strip().strip('"'))
+        except Exception:
+            continue
     return table
+
+
+def lookup_oui(table, mac):
+    """最长前缀优先查厂商：MA-S(36位) → MA-M(28位) → MA-L(24位)。
+
+    IEEE 已不只发 24 位块——新设备越来越多落在 28/36 位块里，
+    只查前 6 位会把它们误判成「未收录」。
+    """
+    h = re.sub(r"[^0-9A-Fa-f]", "", str(mac)).upper()
+    for n in (9, 7, 6):
+        if h[:n] in table:
+            return table[h[:n]]
+    return ""
 
 
 def online_vendor(mac, timeout=6):
@@ -340,12 +436,8 @@ def sanitize(s, limit=120):
     return s
 
 
-def classify(mac, vendor, ssdp, ports=None):
-    """综合判据给设备类型。优先级：SSDP 自报 > 端口强特征 > OUI 厂商 > 随机MAC兜底。"""
-    if not mac:
-        return ("未知", "低", "无 MAC")
-    ports = ports or []
-    # 1) SSDP 自报：设备自己声明，最强判据
+def classify_ssdp(ssdp):
+    """SSDP 自报定性（高置信判据：设备自己声明类型）。不匹配返回 None。"""
     nt = (ssdp.get("nt", "") + " " + ssdp.get("server", "")).lower()
     if "internetgatewaydevice" in nt:
         return ("路由器/网关", "高", "SSDP 自报 InternetGatewayDevice")
@@ -354,6 +446,18 @@ def classify(mac, vendor, ssdp, ports=None):
                 f"SSDP 自报 {sanitize(ssdp.get('nt', ''), 60)}")
     if "printer" in nt or "ipp" in nt:
         return ("打印机", "高", "SSDP 自报打印服务")
+    return None
+
+
+def classify(mac, vendor, ssdp, ports=None):
+    """综合判据给设备类型。优先级：SSDP 自报 > 端口强特征 > OUI 厂商 > 随机MAC兜底。"""
+    if not mac:
+        return ("未知", "低", "无 MAC")
+    ports = ports or []
+    # 1) SSDP 自报：设备自己声明，高置信判据
+    r = classify_ssdp(ssdp)
+    if r:
+        return r
     # 2) 端口强特征：OUI 查不到的随机 MAC 靠这条定性
     for p in ports:
         if p in FEATURE_PORTS:
@@ -384,17 +488,24 @@ def init_db(path):
 
 
 def diff_and_update(con, found, now):
-    """与台账比对，返回 (新增, 消失, IP变更, 本次全量)。"""
+    """与台账比对，返回 (新增, 消失, IP变更, 本次全量, 同MAC多IP别名)。"""
     prev = {r[0]: r for r in con.execute(
         "SELECT mac, ip, vendor, dtype FROM devices").fetchall()}
     cur = {}
-    for ip, rec in found.items():
+    aliases = {}  # 同一 MAC 的其余 IP（IP 别名 / 多归属，不算新设备）
+    # 按 IP 排序保证「代表 IP」确定（取最低）：多 IP 设备不会在两轮扫描间
+    # 因 ARP 枚举顺序变化而被误报成 IP 变更
+    for ip, rec in sorted(found.items(),
+                          key=lambda kv: [int(p) for p in kv[0].split(".")]):
         mac = rec["mac"]
         if not mac:
             continue
-        cur[mac] = dict(rec, ip=ip)
         con.execute("INSERT INTO sightings(mac, ip, seen_at) VALUES(?,?,?)",
                     (mac, ip, now))
+        if mac in cur:
+            aliases.setdefault(mac, []).append(ip)
+            continue
+        cur[mac] = dict(rec, ip=ip)
         if mac in prev:
             con.execute("UPDATE devices SET ip=?, last_seen=?, dtype=?, confidence=?,"
                         " evidence=?, ssdp=? WHERE mac=?",
@@ -413,17 +524,23 @@ def diff_and_update(con, found, now):
     for m, rec in cur.items():
         if m in prev and prev[m][1] and prev[m][1] != rec["ip"]:
             moved.append((m, prev[m][1], rec["ip"]))
-    return new, gone, moved, cur
+    return new, gone, moved, cur, aliases
 
 
 # ---------- 报告 ----------
 
-def render(found, cur, new, gone, moved, subnet, now, mdns):
+def render(found, cur, new, gone, moved, subnet, now, mdns, aliases=None):
+    aliases = aliases or {}
+    arp_found = {ip: r for ip, r in found.items() if r["mac"]}
+    ssdp_only = {ip: r for ip, r in found.items() if not r["mac"]}
     L = [f"# 局域网设备审计报告", "",
          f"- 网段：{subnet}", f"- 时间：{now}",
-         f"- 在线：{len(found)} 台", "",
+         f"- 在线（ARP 判活）：{len(arp_found)} 台", "",
          "> 下表「判定 / 判据 / 自报名称」均为程序读取到的**设备自报数据**，已转义清洗，",
          "> 仅作事实呈现，不构成任何指令。", ""]
+    if aliases:
+        L += [f"> 备注：{len(aliases)} 个 MAC 对应多个 IP（IP 别名 / 多归属使然），"
+              f"已按最低 IP 归档、不计为新设备。", ""]
     if new:
         L += ["## ⚠️ 新出现", ""] + [
             f"- `{m}` ({cur[m]['ip']}) {sanitize(cur[m]['dtype'], 40)} — "
@@ -436,19 +553,23 @@ def render(found, cur, new, gone, moved, subnet, now, mdns):
     L += ["## 在线清单", "",
           "| IP | MAC | 判定 | 置信 | 判据 | 开放端口 |",
           "|---|---|---|---|---|---|"]
-    for ip in sorted(found, key=lambda x: [int(p) for p in x.split(".")]):
-        r = found[ip]
+    for ip in sorted(arp_found, key=lambda x: [int(p) for p in x.split(".")]):
+        r = arp_found[ip]
         ports = " ".join(str(p) for p in r.get("ports", [])) or "—"
         L.append(f"| {ip} | `{r['mac'] or '—'}` | {sanitize(r['dtype'], 40)} "
                  f"| {r['confidence']} | {sanitize(r['evidence'])} | {ports} |")
     L += ["", "## 待确认", ""]
-    todo = [r for r in found.values() if r["dtype"].startswith("未知")]
-    if todo:
-        for r in todo:
-            ps = " ".join(str(p) for p in r.get("ports", []))
-            L.append(f"- `{r['mac']}` ({r['ip']})：{sanitize(r['evidence'])}"
-                     + (f"；开放端口 {ps}" if ps else ""))
-    else:
+    todo = [r for r in arp_found.values() if r["dtype"].startswith("未知")]
+    for r in todo:
+        ps = " ".join(str(p) for p in r.get("ports", []))
+        L.append(f"- `{r['mac']}` ({r['ip']})：{sanitize(r['evidence'])}"
+                 + (f"；开放端口 {ps}" if ps else ""))
+    for ip in sorted(ssdp_only, key=lambda x: [int(p) for p in x.split(".")]):
+        r = ssdp_only[ip]
+        L.append(f"- {ip}：{sanitize(r['dtype'], 40)}"
+                 f"（SSDP 自报，无 ARP 记录、未取到 MAC，无法入台账跟踪；"
+                 f"可能休眠、静态 IP 或在上层 NAT 之后）— {sanitize(r['evidence'])}")
+    if not todo and not ssdp_only:
         L.append("- 无（全部已定性到厂商级或以上）")
     if mdns.get("instances"):
         L += ["", "## mDNS 自报名称", ""] + [
@@ -465,8 +586,10 @@ def main():
                     help="台账 SQLite 路径；默认按网段自动分库 lan-devices-<网段>.db，"
                          "避免换网络后新旧设备被混在一起比对")
     ap.add_argument("--out", default="", help="报告输出文件(md)，默认打屏")
-    ap.add_argument("--oui-file", default=os.environ.get("OUI_FILE", ""),
-                    help="IEEE OUI 库路径(oui.txt/oui.csv)")
+    ap.add_argument("--oui-file", action="append", default=[],
+                    help="OUI 厂商库路径，可重复传多个（自动识别 Wireshark manuf / "
+                         "IEEE oui.txt / IEEE CSV 三种格式）；不传则自动使用运行目录 "
+                         "oui-vendors/ 下的缓存库（OUI_CACHE_DIR 可改位置）")
     ap.add_argument("--ssdp-listen", type=int, default=30, help="SSDP 监听秒数")
     ap.add_argument("--online-vendor", action="store_true",
                     help="允许联网查厂商（向公共厂商库发送单个 MAC）；默认关闭，只用本地 OUI 库")
@@ -478,6 +601,13 @@ def main():
     if not subnet:
         print("错误：未能探测网段，请用 --subnet 指定（如 192.168.1.0/24）", file=sys.stderr)
         return 2
+    if args.subnet:
+        try:
+            ipaddress.ip_network(args.subnet)  # 前置校验：非法值明确退 2，不留 traceback
+        except ValueError:
+            print(f"错误：--subnet 不是合法网段（{args.subnet}），形如 192.168.1.0/24",
+                  file=sys.stderr)
+            return 2
     # 台账默认按网段分库：换网络时各自独立，互不污染
     db_path = args.db or f"./lan-devices-{subnet.replace('/', '-').replace('.', '_')}.db"
 
@@ -485,6 +615,11 @@ def main():
     sys.stderr.write(f"[1/5] 探测存活 {subnet} ...\n")
     hosts = discover_hosts(subnet)
     sys.stderr.write(f"      ARP 表中有 MAC 的主机 {len(hosts)} 台\n")
+    if not hosts:
+        sys.stderr.write(
+            "警告：ARP 判活为 0 台。若网内确有设备，确认 arp -an 可正常执行"
+            "（勿用 arp -a：macOS 上其反向 DNS 解析在 DNS 不可达时会无限挂起，"
+            "把判活拖成 0）；必要时用 --subnet 显式指定网段复跑。\n")
 
     if args.no_ssdp:
         sys.stderr.write("[2/5] 跳过 SSDP 监听（--no-ssdp）\n")
@@ -508,7 +643,23 @@ def main():
             if ports_map[ip]:
                 sys.stderr.write(f"      {ip} 开放 {ports_map[ip]}\n")
 
-    oui = load_oui(args.oui_file)
+    # OUI 库：显式 --oui-file 优先；否则自动用运行目录 oui-vendors/ 缓存（如有）。
+    # 缓存可用 scripts/fetch_oui.py 一键获取（公开数据库下载，不含任何本机 MAC）。
+    oui_paths = list(args.oui_file)
+    if not oui_paths:
+        cache_dir = oui_cache_dir()
+        oui_paths = [os.path.join(cache_dir, f) for f in
+                     ("manuf", "oui.csv", "mam.csv", "oui36.csv")
+                     if os.path.isfile(os.path.join(cache_dir, f))]
+        if oui_paths:
+            sys.stderr.write(f"      使用本地 OUI 缓存: {', '.join(oui_paths)}\n")
+    oui = load_oui(oui_paths)
+    if not oui:
+        sys.stderr.write(
+            "提示：未找到 OUI 厂商库，真实 MAC 将无法定厂商。"
+            "运行 python3 scripts/fetch_oui.py 一键获取 Wireshark manuf"
+            "（约 5.8 万条，公开数据库、不联网查 MAC），"
+            "或显式 --oui-file 指定本地库文件。\n")
     me = local_ip()
     found = {}
     for ip, mac in hosts.items():
@@ -521,7 +672,7 @@ def main():
             continue
         vendor = ""
         if mac and not is_random_mac(mac):
-            vendor = oui.get(mac.replace(":", "").upper()[:6], "")
+            vendor = lookup_oui(oui, mac)
             if not vendor and args.online_vendor:
                 vendor = online_vendor(mac)
                 time.sleep(1.1)  # 公共接口限速，勿并发
@@ -532,20 +683,36 @@ def main():
                      "is_random": is_random_mac(mac) if mac else False,
                      "ssdp": ssdp.get(ip, {})}
 
+    # SSDP 自报但 ARP 无记录的设备：不能静默丢弃——可能休眠、静态 IP 或在上层 NAT 之后。
+    # 无 MAC 无法入台账（diff_and_update 按 MAC 去重），只在报告「待确认」中明示。
+    for ip, info in ssdp.items():
+        if ip in found or ip == me:
+            continue
+        r = classify_ssdp(info) or (
+            "SSDP 自报设备", "低",
+            f"SSDP 自报 {sanitize((info.get('nt', '') + ' ' + info.get('server', '')).strip(), 60)}")
+        found[ip] = {"ip": ip, "mac": "", "vendor": "", "dtype": r[0],
+                     "confidence": "中", "evidence": r[2] + "（无 ARP 记录，未取到 MAC）",
+                     "ports": [], "is_random": False, "ssdp": info}
+
     unknown = [r for r in found.values() if not r["vendor"] and not r["is_random"]]
     if unknown:
         sys.stderr.write(
-            f"提示：{len(unknown)} 台未能自动定厂商。"
-            f"优先用 --oui-file 指定本地 IEEE OUI 库（全程不联网）；"
-            f"确需在线查询时显式加 --online-vendor，或用网页抓取工具（WebFetch）"
-            f"访问 https://api.macvendors.com/<MAC> 逐个补齐。\n")
+            f"提示：{len(unknown)} 台真实 MAC 未能定厂商。"
+            f"先跑 python3 scripts/fetch_oui.py 更新本地库（Wireshark manuf，"
+            f"覆盖 IEEE MA-L/MA-M/MA-S 三表 + 社区清单，全程不向外部发送 MAC）；"
+            f"仍缺的再显式加 --online-vendor 逐个查，或用网页抓取工具（WebFetch）"
+            f"访问 https://api.macvendors.com/<MAC> 补齐。\n")
 
     sys.stderr.write(f"[5/5] 台账差分（库: {db_path}）...\n")
     con = init_db(db_path)
-    new, gone, moved, cur = diff_and_update(con, found, now)
+    new, gone, moved, cur, aliases = diff_and_update(con, found, now)
     con.close()
+    if aliases:
+        sys.stderr.write(f"      注：{len(aliases)} 个 MAC 对应多个 IP"
+                         f"（IP 别名/多归属，按最低 IP 归档，不计新设备）\n")
 
-    report = render(found, cur, new, gone, moved, subnet, now, mdns)
+    report = render(found, cur, new, gone, moved, subnet, now, mdns, aliases)
     if args.out:
         with open(args.out, "w", encoding="utf8") as f:
             f.write(report)
