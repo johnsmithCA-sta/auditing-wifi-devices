@@ -17,6 +17,7 @@ OUI_CACHE_DIR 可改位置）。
 退出码: 0 成功 / 2 参数或环境错误
 """
 import argparse
+import errno
 import ipaddress
 import json
 import os
@@ -28,6 +29,8 @@ import sys
 import time
 import urllib.request
 from datetime import datetime
+
+__version__ = "0.4.5"  # 与 SKILL.md frontmatter 同步
 
 # ---------- 工具 ----------
 
@@ -111,9 +114,12 @@ def discover_hosts(subnet):
         run(f"fping -a -g -r 1 -t 400 {subnet}", timeout=120)
     else:
         net = ipaddress.ip_network(subnet)
-        # 无 fping 时用 ping 兜底，仅抽样前 254 个地址
+        # 无 fping 时用 ping 兜底，仅抽样前 254 个地址。
+        # -W 的单位不同：macOS 是毫秒、Linux 是秒——写错会立刻返回，
+        # 内核还没学完 ARP 就去读表，等于白跑一轮。
+        wait = "1000" if sys.platform == "darwin" else "1"
         for host in list(net.hosts())[:254]:
-            run(f"ping -c 1 -W 1 {host}", timeout=3)
+            run(f"ping -c 1 -W {wait} {host}", timeout=4)
     # 2) 读 ARP（只保留目标网段内的条目——ARP 表会因历史通信残留其他网段的记录，
     #    显式 --subnet 缩范围时必须守住，否则扫描范围形同虚设）
     net = ipaddress.ip_network(subnet)
@@ -161,25 +167,85 @@ def parse_arp():
     return keep
 
 
-def sniff_ssdp(seconds=30):
-    """被动监听 SSDP/UPnP 广播。返回 {ip: {'server':..,'nt':..,'location':..}}。
+MSEARCH_TMPL = ("M-SEARCH * HTTP/1.1\r\n"
+                "HOST: 239.255.255.250:1900\r\n"
+                'MAN: "ssdp:discover"\r\n'
+                "MX: 2\r\n"
+                "ST: ssdp:all\r\n\r\n")
 
-    这是识别 IoT 的高性价比手段：设备会自报 SERVER 与设备类型。
+
+def sniff_ssdp(seconds=30):
+    """SSDP 发现 = 被动监听 NOTIFY + 主动 M-SEARCH 查询。
+
+    返回 {ip: {'server':..,'nt':..,'st':..,'location':..}}。
+
+    只被动监听会漏掉一大批设备：很多设备上线后不再主动 NOTIFY，只在被查询时
+    单播应答（实测某家庭网络被动 55s 得 0 台，同一窗口主动 M-SEARCH 得 3 台）。
+    因此这里在监听窗口内补 3 次 M-SEARCH，两者结果合并去重。
+
+    套接字必须绑 INADDR_ANY 而非组播地址：绑组播地址只收得到发往该组的报文，
+    M-SEARCH 的单播应答会被内核过滤掉，表现为「发了查询却零应答」。
     """
     import struct
     result = {}
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("239.255.255.250", 1900))
-        s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-                     struct.pack("4sl", socket.inet_aton("239.255.255.250"),
-                                 socket.INADDR_ANY))
-        s.settimeout(1.0)
-    except Exception:
+        try:  # macOS 上允许与系统 mDNSResponder 等其他进程共用 1900
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except Exception:
+            pass
+    except Exception as e:
+        sys.stderr.write(f"      SSDP 跳过：无法创建 UDP 套接字（{e}）\n")
         return result
+
+    listening = False
+    try:
+        s.bind(("", 1900))
+        listening = True
+    except OSError as e:
+        # 1900 常被其他 SSDP 客户端占着（未开 SO_REUSEPORT）。此时主动查询仍然有效：
+        # M-SEARCH 的单播应答会回到源端口，不需要 1900。降级而不是静默归零。
+        try:
+            s.bind(("", 0))
+            sys.stderr.write(
+                f"      提示：UDP 1900 不可用（{e}），降级为随机端口发 M-SEARCH"
+                f"（收不到被动 NOTIFY）；排查：lsof -nP -iUDP:1900\n")
+        except Exception as e2:
+            sys.stderr.write(f"      SSDP 跳过：绑定端口失败（{e2}）\n")
+            try:
+                s.close()
+            except Exception:
+                pass
+            return result
+
+    if listening:
+        try:
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                         struct.pack("4sl", socket.inet_aton("239.255.255.250"),
+                                     socket.INADDR_ANY))
+        except Exception as e:
+            # VPN / 多网卡 / 无组播路由时常见：仍可发 M-SEARCH，只是收不到 NOTIFY
+            sys.stderr.write(f"      提示：加入 SSDP 组播组失败（{e}），"
+                             f"仅用 M-SEARCH 主动查询\n")
+    try:  # 别把自己发的 M-SEARCH 当成设备自报
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
+    except Exception:
+        pass
+    s.settimeout(1.0)
+
+    probe = MSEARCH_TMPL.encode()
+    sent, failed, next_send = 0, 0, 0.0
+    gap = max(1.0, seconds / 4.0)
     end = time.time() + seconds
     while time.time() < end:
+        if sent < 3 and time.time() >= next_send:
+            try:
+                s.sendto(probe, ("239.255.255.250", 1900))
+                sent += 1
+            except Exception:
+                failed += 1
+            next_send = time.time() + gap
         try:
             data, addr = s.recvfrom(4096)
         except socket.timeout:
@@ -189,8 +255,10 @@ def sniff_ssdp(seconds=30):
         txt = data.decode("utf8", "ignore")
         ip = addr[0]
         info = result.setdefault(ip, {})
+        # M-SEARCH 的应答用 ST 字段（NOTIFY 用 NT），两者都要收
         for key, pat in (("server", r"(?im)^SERVER:\s*(.+)$"),
                          ("nt", r"(?im)^NT:\s*(.+)$"),
+                         ("st", r"(?im)^ST:\s*(.+)$"),
                          ("location", r"(?im)^LOCATION:\s*(.+)$")):
             m = re.search(pat, txt)
             if m:
@@ -203,17 +271,38 @@ def sniff_ssdp(seconds=30):
         s.close()
     except Exception:
         pass
-    return {ip: v for ip, v in result.items() if v.get("server") or v.get("nt")}
+    if failed and not result:
+        sys.stderr.write(
+            f"      警告：{failed} 次 M-SEARCH 发送失败且未收到应答"
+            f"（无组播路由 / 被安全软件拦截 / 网络隔离）\n")
+    return {ip: v for ip, v in result.items()
+            if v.get("server") or v.get("nt") or v.get("st")}
 
 
 MDNS_SERVICES = ["_airplay._tcp", "_raop._tcp", "_companion-link._tcp",
                  "_http._tcp", "_workstation._tcp", "_ipp._tcp"]
 
 
+def _mdns_instance(line):
+    """从 `dns-sd -B` 的一行里取出实例名；非 Add 行、或只有服务类型行返回 ''。
+
+    行格式（列序固定，实例名可能含空格）：
+        19:18:05.451  Add  3  1 local.  _airplay._tcp.  <实例名>
+    """
+    if not re.search(r"\bAdd\b", line):
+        return ""
+    parts = line.split()
+    if len(parts) < 7:
+        return ""
+    name = " ".join(parts[6:]).strip()
+    return "" if (not name or name.startswith("_")) else name
+
+
 def browse_mdns(per_service=3):
     """浏览常见 mDNS 服务，收集设备自报实例名。
 
-    实例名无法直接反查 IP（需额外 -L/-G 两步），故只作为辅助佐证列出。
+    实例名反查 IP 需额外 -L / -G 两步（做法见 references/device-fingerprints.md §三），
+    脚本这里只作辅助佐证列出，不自动解析。
     当前只实现 macOS 的 dns-sd；Linux 上即使装有 avahi-browse 也未接解析，
     明确提示跳过而不是静默返回空。
     """
@@ -235,13 +324,9 @@ def browse_mdns(per_service=3):
         except Exception:
             out = ""
         for line in out.splitlines():
-            if re.search(r"\bAdd\b", line):
-                # 实例名在最后一列之后
-                m = re.search(r"local\.\s+(\S.*)$", line)
-                if m:
-                    name = m.group(1).strip()
-                    if name and not name.startswith("_"):
-                        names.add(name)
+            name = _mdns_instance(line)
+            if name:
+                names.add(name)
     return {"instances": sorted(names)}
 
 
@@ -390,25 +475,40 @@ FEATURE_PORTS = {
 AUX_PORTS = (80, 443, 8080, 8443, 5000, 5001, 49152)
 
 
-def probe_ports(ip, ports, timeout=0.5, workers=60):
-    """并发 TCP 探测，返回按端口号排序的开放列表。"""
+def probe_ports_ex(ip, ports, timeout=0.5, workers=60):
+    """并发 TCP 探测，返回 (开放端口列表, 是否收到 RST 判活信号)。
+
+    connect_ex 的 errno 三档（Guidelines「errno 三档含义」的落地）：
+      0                      -> 端口开放，可作类型判据
+      ECONNREFUSED/ECONNRESET -> 主机确定在线（发了 RST），只是该端口不监听
+      ETIMEDOUT/EHOSTUNREACH  -> 这次没回，**既不判活也不判无**，不能拿来分辨幽灵
+    """
     import concurrent.futures as cf
-    open_ports = []
+    open_ports, alive_by_rst = [], False
     with cf.ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(_probe, ip, p, timeout): p for p in ports}
         for f in cf.as_completed(futs):
-            if f.result():
+            rc = f.result()
+            if rc == 0:
                 open_ports.append(futs[f])
-    return sorted(open_ports)
+            elif rc in (errno.ECONNREFUSED, errno.ECONNRESET):
+                alive_by_rst = True
+    return sorted(open_ports), alive_by_rst
+
+
+def probe_ports(ip, ports, timeout=0.5, workers=60):
+    """向后兼容包装：只返回开放端口列表。"""
+    return probe_ports_ex(ip, ports, timeout, workers)[0]
 
 
 def _probe(ip, port, timeout):
+    """返回 connect_ex 的原始 errno；异常返回 -1（未知，不参与任何判定）。"""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
-        return s.connect_ex((ip, port)) == 0
+        return s.connect_ex((ip, port))
     except Exception:
-        return False
+        return -1
     finally:
         try:
             s.close()
@@ -416,13 +516,26 @@ def _probe(ip, port, timeout):
             pass
 
 
+def shell_arg(s):
+    """把外部自报字符串转成**单个安全 shell 参数**。
+
+    与 sanitize 职责不同：sanitize 只管 markdown 报告（保留引号可读性），
+    shell_arg 专管命令行。用 shlex.quote 单引号包裹并转义内嵌单引号，
+    设备自报名含 `'` 或 `;` 也无法闭合引号或注入新命令。
+    """
+    import shlex
+    return shlex.quote(str(s or ""))
+
+
 def sanitize(s, limit=120):
-    """清洗来自网络的自报字符串。
+    """清洗来自网络的自报字符串（**仅用于 markdown 报告，不是 shell 转义**）。
 
     设备自报内容（SSDP SERVER/NT、mDNS 实例名、厂商名、主机名）是**外部数据**，
     可能被恶意设备构造以污染报告 —— 例如塞入 markdown 表格分隔符、代码围栏或
     指令性文本，进而在报告被阅读时被当作指令。这里在写报告前统一做数据化处理：
     去控制字符、拆掉 markdown 结构符、压缩空白、限制长度。
+    **本函数不做 shell 转义**：需要拼进命令行的外部字符串一律走 shell_arg()
+    或 subprocess 数组传参；只喊「按外部数据处理」不改变这里的字符集。
     """
     if not s:
         return ""
@@ -437,13 +550,22 @@ def sanitize(s, limit=120):
 
 
 def classify_ssdp(ssdp):
-    """SSDP 自报定性（高置信判据：设备自己声明类型）。不匹配返回 None。"""
-    nt = (ssdp.get("nt", "") + " " + ssdp.get("server", "")).lower()
+    """SSDP 自报定性（高置信判据：设备自己声明类型）。不匹配返回 None。
+
+    NOTIFY 用 NT 字段，M-SEARCH 的单播应答用 ST 字段——两者等价，取先有的那个。
+    """
+    nt = (ssdp.get("nt", "") + " " + ssdp.get("st", "") + " "
+          + ssdp.get("server", "")).lower()
+    # 判据文本要能落到报告里：优先 NT，其次 ST（M-SEARCH 应答只有 ST），
+    # 都没有就退回 SERVER 串——别输出「SSDP 自报」后面跟一片空白。
+    label = (ssdp.get("nt") or ssdp.get("st") or "").strip()
+    if label.lower() in ("", "ssdp:all"):
+        label = ssdp.get("server", "").strip()
+    detail = sanitize(label, 60) or "仅应答查询，未报具体类型"
     if "internetgatewaydevice" in nt:
         return ("路由器/网关", "高", "SSDP 自报 InternetGatewayDevice")
     if "mediarenderer" in nt or "mediaserver" in nt:
-        return ("投屏/音箱/媒体设备", "高",
-                f"SSDP 自报 {sanitize(ssdp.get('nt', ''), 60)}")
+        return ("投屏/音箱/媒体设备", "高", f"SSDP 自报 {detail}")
     if "printer" in nt or "ipp" in nt:
         return ("打印机", "高", "SSDP 自报打印服务")
     return None
@@ -482,7 +604,12 @@ def init_db(path):
         evidence TEXT, is_random INTEGER, ssdp TEXT,
         first_seen TEXT, last_seen TEXT, note TEXT DEFAULT '')""")
     con.execute("""CREATE TABLE IF NOT EXISTS sightings(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, mac TEXT, ip TEXT, seen_at TEXT)""")
+        id INTEGER PRIMARY KEY AUTOINCREMENT, mac TEXT, ip TEXT, seen_at TEXT,
+        quiet INTEGER DEFAULT 0)""")
+    # 兼容旧库：旧台账没有 quiet 列时原地补一列，不丢历史快照
+    cols = [r[1] for r in con.execute("PRAGMA table_info(sightings)").fetchall()]
+    if "quiet" not in cols:
+        con.execute("ALTER TABLE sightings ADD COLUMN quiet INTEGER DEFAULT 0")
     con.commit()
     return con
 
@@ -500,8 +627,9 @@ def diff_and_update(con, found, now):
         mac = rec["mac"]
         if not mac:
             continue
-        con.execute("INSERT INTO sightings(mac, ip, seen_at) VALUES(?,?,?)",
-                    (mac, ip, now))
+        quiet = int(not rec.get("ports") and not rec.get("ssdp"))
+        con.execute("INSERT INTO sightings(mac, ip, seen_at, quiet) VALUES(?,?,?,?)",
+                    (mac, ip, now, quiet))
         if mac in cur:
             aliases.setdefault(mac, []).append(ip)
             continue
@@ -529,15 +657,87 @@ def diff_and_update(con, found, now):
 
 # ---------- 报告 ----------
 
-def render(found, cur, new, gone, moved, subnet, now, mdns, aliases=None):
+def ghost_candidates(con, min_streak=3, rst_alive=None):
+    """Guidelines「连续 >=3 次快照都在、且每次零开放端口零自报」的落地。
+
+    只**点名候选**、不判定「在线/离线」——休眠手机与代答幽灵在网络侧同构
+    （SKILL.md Guidelines 明确否定「ICMP 全丢 + 端口全超时」这条分辨判据）。
+    rst_alive：本轮收到 RST（ECONNREFUSED/ECONNRESET）的 MAC 集合，这些主机
+    已由正向判据确定在线，不进候选。
+    """
+    rst_alive = rst_alive or set()
+    try:
+        rows = con.execute(
+            "SELECT mac, ip, seen_at, quiet FROM sightings ORDER BY id").fetchall()
+    except sqlite3.Error:
+        return []
+    # 同一 (mac, 快照时刻) 可能因多 IP 别名有多行；取最保守值：
+    # 只要该快照里任一 IP 有端口或自报，就不算「零开放端口零自报」
+    snaps = {}
+    for mac, ip, seen_at, quiet in rows:
+        key = (mac, seen_at)
+        snaps[key] = min(snaps.get(key, 1), int(quiet or 0))
+    streak, last_ip = {}, {}
+    for (mac, seen_at), quiet in sorted(snaps.items(), key=lambda kv: kv[0][1]):
+        last_ip[mac] = last_ip.get(mac, "")
+        if quiet:
+            streak[mac] = streak.get(mac, 0) + 1
+        else:
+            streak[mac] = 0
+    # 取代表 IP（最近一次快照）
+    for mac, ip, seen_at, quiet in rows:
+        last_ip[mac] = ip
+    return [{"mac": m, "ip": last_ip.get(m, ""), "streak": n}
+            for m, n in sorted(streak.items())
+            if n >= min_streak and m not in rst_alive]
+
+
+def verdict(cur, new, todo, ssdp_only, has_baseline, ghosts=None):
+    """Goal 5：给出「有 / 无 / 待确认」结论，不把判断留给用户。
+
+    判据可证伪：真实 MAC 的新出现是强信号；只有随机 MAC 新出现、或存在
+    未定性/幽灵候选时落「待确认」并附下一步手段，避免把地址轮换误报成蹭网。
+    """
+    ghosts = ghosts or []
+    real_new = [m for m in new if cur.get(m) and not cur[m].get("is_random")]
+    rand_new = [m for m in new if m not in real_new]
+    if not has_baseline:
+        return ("待确认", "首次建账，无历史基线，无法判定陌生设备。",
+                "补一份自家设备清单，或按 Step 4 与路由器「已连接设备」列表核对后复扫一轮。")
+    if real_new:
+        return ("有", f"相对台账新出现 {len(real_new)} 个真实 MAC"
+                + (f"（另有 {len(rand_new)} 个随机地址，可能是私有地址轮换）" if rand_new else ""),
+                "对每台走 Step 3 定性 + 路由器 DHCP 主机名核对；确认非自家设备再走处置流程。")
+    if todo or ssdp_only or ghosts or rand_new:
+        bits = []
+        if todo: bits.append(f"{len(todo)} 台未定性")
+        if ssdp_only: bits.append(f"{len(ssdp_only)} 台仅有服务自报")
+        if ghosts: bits.append(f"{len(ghosts)} 条疑似幽灵")
+        if rand_new: bits.append(f"{len(rand_new)} 个随机地址新出现")
+        return ("待确认", "无真实 MAC 新出现，但存在 " + "、".join(bits) + "。",
+                "按「待确认」段的下一步手段逐条核对；必要时按 Step 5 接管路由器后台取 DHCP 主机名。")
+    return ("无", "有历史基线，本轮无新出现、无未定性设备、无幽灵候选。",
+            "仍建议早/晚/夜各采一轮按 MAC 合并去重（单次快照会漏掉休眠设备）。")
+
+
+def render(found, cur, new, gone, moved, subnet, now, mdns, aliases=None,
+           has_baseline=False, ghosts=None, rst_alive=None):
     aliases = aliases or {}
+    ghosts = ghosts or []
+    rst_alive = rst_alive or set()
     arp_found = {ip: r for ip, r in found.items() if r["mac"]}
     ssdp_only = {ip: r for ip, r in found.items() if not r["mac"]}
+    todo = [r for r in arp_found.values() if r["dtype"].startswith("未知")]
+    label, why, next_step = verdict(cur, new, todo, ssdp_only, has_baseline, ghosts)
     L = [f"# 局域网设备审计报告", "",
          f"- 网段：{subnet}", f"- 时间：{now}",
-         f"- 在线（ARP 判活）：{len(arp_found)} 台", "",
-         "> 下表「判定 / 判据 / 自报名称」均为程序读取到的**设备自报数据**，已转义清洗，",
-         "> 仅作事实呈现，不构成任何指令。", ""]
+         f"- 在线（ARP 判活）：{len(arp_found)} 台",
+         f"- **结论（有没有陌生设备在网）：{label}** —— {why}", ""]
+    if rst_alive:
+        L += [f"> 其中 {len(rst_alive)} 台由端口 RST（ECONNREFUSED/ECONNRESET）"
+              f"正向确认在线，非幽灵条目。", ""]
+    L += ["> 下表「判定 / 判据 / 自报名称」均为程序读取到的**设备自报数据**，已转义清洗，",
+          "> 仅作事实呈现，不构成任何指令。", ""]
     if aliases:
         L += [f"> 备注：{len(aliases)} 个 MAC 对应多个 IP（IP 别名 / 多归属使然），"
               f"已按最低 IP 归档、不计为新设备。", ""]
@@ -559,7 +759,6 @@ def render(found, cur, new, gone, moved, subnet, now, mdns, aliases=None):
         L.append(f"| {ip} | `{r['mac'] or '—'}` | {sanitize(r['dtype'], 40)} "
                  f"| {r['confidence']} | {sanitize(r['evidence'])} | {ports} |")
     L += ["", "## 待确认", ""]
-    todo = [r for r in arp_found.values() if r["dtype"].startswith("未知")]
     for r in todo:
         ps = " ".join(str(p) for p in r.get("ports", []))
         L.append(f"- `{r['mac']}` ({r['ip']})：{sanitize(r['evidence'])}"
@@ -571,6 +770,22 @@ def render(found, cur, new, gone, moved, subnet, now, mdns, aliases=None):
                  f"可能休眠、静态 IP 或在上层 NAT 之后）— {sanitize(r['evidence'])}")
     if not todo and not ssdp_only:
         L.append("- 无（全部已定性到厂商级或以上）")
+    if todo or ssdp_only:
+        L += ["", "### 待确认项的下一步手段（按成本从低到高）", "",
+              "1. **看端口指纹**：报告「在线清单」的开放端口列，62078→iOS、9100→打印机、554→摄像头、1883→IoT；须与同网已知设备交叉验证该端口是否独有。",
+              "2. **取路由器 DHCP 客户端列表的主机名**（权威度最高）：在用户已登录的浏览器里读取，或请用户人工摘录名称与 IP（**勿贴密码**）。",
+              "3. **关闭该网络的「私有 Wi-Fi 地址 / 随机 MAC」后重连**：真实 MAC 出现即可查厂商，也是让白名单稳定的前提。",
+              "4. 以上仍定不了 → 在设备端物理核对，或早/晚/夜各采一轮按 MAC 合并去重；**单次快照不下生命周期结论**。"]
+    if ghosts:
+        L += ["", "## 疑似幽灵条目（连续 ≥3 次快照、每次零开放端口零自报）", "",
+              "> 仅**点名候选**，不判定离线：休眠设备与代答条目在网络侧同构。",
+              "> 已由端口 RST 正向确认在线的主机不在此列。", ""]
+        for g in ghosts:
+            L.append(f"- `{g['mac']}` ({g['ip']}) 连续 {g['streak']} 次快照零端口零自报 —— "
+                     f"两条外部核对：① 路由器「IP与MAC绑定」页看是否有人手工绑过；"
+                     f"② 查台账 `dtype='本机'` 的历史 MAC，相同即本机私有地址残留，剔除。")
+        L += ["", "> 结论维持「待确认」直到完成上述核对；**不要用「ICMP 全丢 + 端口全超时」判离线**。", ""]
+    L += ["", f"> 结论后续动作：{next_step}", ""]
     if mdns.get("instances"):
         L += ["", "## mDNS 自报名称", ""] + [
             f"- {sanitize(n, 60)}" for n in mdns["instances"][:20]]
@@ -590,12 +805,17 @@ def main():
                     help="OUI 厂商库路径，可重复传多个（自动识别 Wireshark manuf / "
                          "IEEE oui.txt / IEEE CSV 三种格式）；不传则自动使用运行目录 "
                          "oui-vendors/ 下的缓存库（OUI_CACHE_DIR 可改位置）")
-    ap.add_argument("--ssdp-listen", type=int, default=30, help="SSDP 监听秒数")
+    ap.add_argument("--ssdp-listen", type=int, default=30,
+                    help="SSDP 监听秒数（下限 5；窗口内会补 3 次 M-SEARCH，太短发不满）")
     ap.add_argument("--online-vendor", action="store_true",
                     help="允许联网查厂商（向公共厂商库发送单个 MAC）；默认关闭，只用本地 OUI 库")
     ap.add_argument("--no-ssdp", action="store_true", help="跳过 SSDP 监听")
     ap.add_argument("--no-ports", action="store_true", help="跳过端口指纹探测")
     args = ap.parse_args()
+    if args.ssdp_listen < 5:
+        print("错误：--ssdp-listen 至少 5 秒（窗口内要发 3 次 M-SEARCH，太短发不满）",
+              file=sys.stderr)
+        return 2
 
     subnet = args.subnet or detect_subnet()
     if not subnet:
@@ -625,7 +845,7 @@ def main():
         sys.stderr.write("[2/5] 跳过 SSDP 监听（--no-ssdp）\n")
         ssdp = {}
     else:
-        sys.stderr.write(f"[2/5] SSDP 被动监听 {args.ssdp_listen}s ...\n")
+        sys.stderr.write(f"[2/5] SSDP 监听（被动 NOTIFY + 3 次 M-SEARCH）{args.ssdp_listen}s ...\n")
         ssdp = sniff_ssdp(args.ssdp_listen)
         sys.stderr.write(f"      捕获自报 {len(ssdp)} 台\n")
 
@@ -635,13 +855,19 @@ def main():
     sys.stderr.write("[4/5] 端口指纹 + 厂商与类型识别 ...\n")
     plist = sorted(set(FEATURE_PORTS) | set(AUX_PORTS))
     ports_map = {}
+    rst_alive_ips = set()
     if args.no_ports:
         ports_map = {ip: [] for ip in hosts}
     else:
         for ip in hosts:
-            ports_map[ip] = probe_ports(ip, plist)
-            if ports_map[ip]:
-                sys.stderr.write(f"      {ip} 开放 {ports_map[ip]}\n")
+            op, rst = probe_ports_ex(ip, plist)
+            ports_map[ip] = op
+            if rst:
+                rst_alive_ips.add(ip)
+            if op:
+                sys.stderr.write(f"      {ip} 开放 {op}\n")
+    if rst_alive_ips:
+        sys.stderr.write(f"      {len(rst_alive_ips)} 台由端口 RST 正向确认在线\n")
 
     # OUI 库：显式 --oui-file 优先；否则自动用运行目录 oui-vendors/ 缓存（如有）。
     # 缓存可用 scripts/fetch_oui.py 一键获取（公开数据库下载，不含任何本机 MAC）。
@@ -690,7 +916,7 @@ def main():
             continue
         r = classify_ssdp(info) or (
             "SSDP 自报设备", "低",
-            f"SSDP 自报 {sanitize((info.get('nt', '') + ' ' + info.get('server', '')).strip(), 60)}")
+            f"SSDP 自报 {sanitize((info.get('nt', '') or info.get('st', '') or info.get('server', '')).strip(), 60) or '仅应答查询'}")
         found[ip] = {"ip": ip, "mac": "", "vendor": "", "dtype": r[0],
                      "confidence": "中", "evidence": r[2] + "（无 ARP 记录，未取到 MAC）",
                      "ports": [], "is_random": False, "ssdp": info}
@@ -706,13 +932,21 @@ def main():
 
     sys.stderr.write(f"[5/5] 台账差分（库: {db_path}）...\n")
     con = init_db(db_path)
+    has_baseline = con.execute("SELECT COUNT(*) FROM devices").fetchone()[0] > 0
     new, gone, moved, cur, aliases = diff_and_update(con, found, now)
+    rst_alive_macs = {found[ip]["mac"] for ip in rst_alive_ips
+                      if ip in found and found[ip].get("mac")}
+    ghosts = ghost_candidates(con, rst_alive=rst_alive_macs)
     con.close()
     if aliases:
         sys.stderr.write(f"      注：{len(aliases)} 个 MAC 对应多个 IP"
                          f"（IP 别名/多归属，按最低 IP 归档，不计新设备）\n")
 
-    report = render(found, cur, new, gone, moved, subnet, now, mdns, aliases)
+    if ghosts:
+        sys.stderr.write(f"      疑似幽灵条目 {len(ghosts)} 条（连续 ≥3 次快照零端口零自报），已在报告单列\n")
+    report = render(found, cur, new, gone, moved, subnet, now, mdns, aliases,
+                    has_baseline=has_baseline, ghosts=ghosts,
+                    rst_alive=rst_alive_macs)
     if args.out:
         with open(args.out, "w", encoding="utf8") as f:
             f.write(report)

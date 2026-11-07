@@ -92,6 +92,134 @@ check("无自报返回 None", ls.classify_ssdp({}) is None)
 check("classify 仍走 SSDP 优先",
       ls.classify("aa:bb:cc:dd:ee:01", "", {"nt": "urn:schemas-upnp-org:device:InternetGatewayDevice:1"}, [62078])[0] == "路由器/网关")
 
+print("== SSDP 主动查询：M-SEARCH 应答的 ST 等价于 NT ==")
+check("只有 ST 也能定性（M-SEARCH 单播应答）",
+      (ls.classify_ssdp({"st": "urn:schemas-upnp-org:device:InternetGatewayDevice:1"}) or ("",))[0] == "路由器/网关")
+check("M-SEARCH 模板是 ssdp:all 探测",
+      "ssdp:all" in ls.MSEARCH_TMPL and "ssdp:discover" in ls.MSEARCH_TMPL)
+_d, _c, _e = ls.classify_ssdp({"st": "urn:schemas-upnp-org:device:MediaRenderer:1"})
+check("只有 ST 时判据文本非空", _d == "投屏/音箱/媒体设备" and _e.strip() not in ("", "SSDP 自报"), str(_e))
+check("无类型信息时不硬判", ls.classify_ssdp({"st": "ssdp:all", "server": "Linux/3.14 UPnP/1.0"}) is None)
+
+print("== mDNS 实例名解析（列序固定，实例名可含空格） ==")
+check("标准 Add 行取出实例名",
+      ls._mdns_instance("19:18:05.451  Add  3  1 local.  _airplay._tcp.  stars的MacBook Air")
+      == "stars的MacBook Air")
+check("服务类型行（实例名以下划线开头）被丢弃",
+      ls._mdns_instance("20:59:05.637  Add  3  11 .  _udp.local.  _asquic") == "")
+check("表头行返回空",
+      ls._mdns_instance("Timestamp     A/R    Flags  if Domain  Service Type  Instance Name") == "")
+check("列数不足返回空", ls._mdns_instance("21:00:00.000  Add 3 1 local.") == "")
+
+print("== 版本一致性 ==")
+_vm = re.search(r"^version:\s*(\S+)",
+                open(os.path.join(HERE, os.pardir, "SKILL.md"), encoding="utf8").read(), re.M)
+check("脚本 __version__ 与 SKILL.md frontmatter 一致",
+      bool(_vm) and ls.__version__ == _vm.group(1),
+      f"{ls.__version__} vs {_vm.group(1) if _vm else '?'}")
+
+print("== 检查器盲区 T2–T5：Changelog 声明必须能被本检查器拦住 ==")
+import subprocess
+_ROOT = os.path.join(HERE, os.pardir)
+# T2: fetch_oui.py --check 纯只读不建目录
+_fo_spec = importlib.util.spec_from_file_location(
+    "fetch_oui_t", os.path.join(HERE, os.pardir, "scripts", "fetch_oui.py"))
+_fo = importlib.util.module_from_spec(_fo_spec); _fo_spec.loader.exec_module(_fo)
+import tempfile as _tf
+_t2dir = os.path.join(_tf.mkdtemp(), "must_not_exist")
+_r2 = subprocess.run([sys.executable, os.path.join(HERE, os.pardir, "scripts", "fetch_oui.py"),
+                      "--check", "--out", _t2dir], capture_output=True, text=True)
+check("T2 fetch_oui --check 不建目录", _r2.returncode == 0 and not os.path.isdir(_t2dir),
+      f"rc={_r2.returncode}")
+# T3: 三闸文档不得被清空
+_rctxt = open(os.path.join(HERE, os.pardir, "references", "router-console.md"), encoding="utf8").read()
+check("T3 三闸章节与关键词齐备",
+      "## 四、写：三闸制" in _rctxt
+      and all(k in _rctxt for k in ("先读后写", "逐条确认", "留痕", "两类")))
+# T4: description 同步声明写能力边界
+_skilltxt = open(os.path.join(HERE, os.pardir, "SKILL.md"), encoding="utf8").read()
+_desc_m = re.search(r"^description:\s*(.+)$", _skilltxt, re.M)
+_desc_s = _desc_m.group(1) if _desc_m else ""
+check("T4 description 行声明受控写边界",
+      all(k in _desc_s for k in ("默认只读", "可代为修改", "白名单", "IP-MAC 绑定")),
+      repr(_desc_s[:80]))
+# T5: 非法 --subnet 退 2 且无 traceback
+_r5 = subprocess.run([sys.executable, os.path.join(HERE, os.pardir, "scripts", "lan_scan.py"),
+                      "--subnet", "GARBAGE", "--no-ssdp", "--no-ports"],
+                     capture_output=True, text=True)
+check("T5 非法 --subnet 退出码 2 无 traceback",
+      _r5.returncode == 2 and "Traceback" not in _r5.stderr, f"rc={_r5.returncode}")
+# 0.4.1 能力：Goal 4/5、幽灵、RST、三闸守卫
+check("Goal5 render 含结论",
+      "结论" in ls.render({}, {}, [], [], [], "192.168.9.0/24", "now", {}))
+check("Goal4 render 含下一步手段",
+      "下一步手段" in ls.render(
+          {"192.168.9.1": {"ip": "192.168.9.1", "mac": "de:ad:be:ef:00:01", "vendor": "",
+                           "dtype": "未知(随机MAC)", "confidence": "低", "evidence": "x",
+                           "ports": [], "is_random": True, "ssdp": {}}},
+          {}, [], [], [], "192.168.9.0/24", "now", {}))
+check("verdict 三态齐备",
+      ls.verdict({}, [], [], [], False)[0] == "待确认"
+      and ls.verdict({"aa": {"is_random": False}}, ["aa"], [], [], True)[0] == "有"
+      and ls.verdict({}, [], [], [], True)[0] == "无")
+check("RST 正向判据代码存在",
+      "ECONNREFUSED" in open(SCAN, encoding="utf8").read()
+      and hasattr(ls, "probe_ports_ex") and hasattr(ls, "ghost_candidates"))
+_wg_spec = importlib.util.spec_from_file_location(
+    "write_guard_t", os.path.join(HERE, os.pardir, "scripts", "write_guard.py"))
+_wg = importlib.util.module_from_spec(_wg_spec); _wg_spec.loader.exec_module(_wg)
+_raises = False
+try:
+    _wg.guarded_write("admin_password", "a", "b", "改", "b")
+except _wg.GuardError:
+    _raises = True
+check("三闸守卫拒绝禁区操作", _raises)
+check("FORBIDDEN 清单完整",
+      len(_wg.FORBIDDEN) >= 12
+      and {"admin_password", "kick_device", "dhcp_pool_or_lease"} <= _wg.FORBIDDEN)
+# 行为级 RST 判活：仅查字符串会让「elif False」逃逸
+import errno as _en
+_rcmap = {80: _en.ECONNREFUSED, 443: _en.ETIMEDOUT}
+class _SockT:
+    def settimeout(self, x): pass
+    def connect_ex(self, a): return _rcmap.get(a[1], -1)
+    def close(self): pass
+_olds = ls.socket.socket
+ls.socket.socket = lambda *a, **k: _SockT()
+_op2, _al2 = ls.probe_ports_ex("1.2.3.4", [80, 443], workers=2)
+ls.socket.socket = _olds
+check("RST 判活信号生效且 ETIMEDOUT 不算开放",
+      _op2 == [] and _al2 is True, f"op={_op2} alive={_al2}")
+# M8 纯 ETIMEDOUT 不得判活
+_rcmap_t = {80: _en.ETIMEDOUT, 443: _en.EHOSTUNREACH}
+class _SockT2:
+    def settimeout(self, x): pass
+    def connect_ex(self, a): return _rcmap_t.get(a[1], -1)
+    def close(self): pass
+ls.socket.socket = lambda *a, **k: _SockT2()
+_op3, _al3 = ls.probe_ports_ex("1.2.3.4", [80, 443], workers=2)
+ls.socket.socket = _olds
+check("纯 ETIMEDOUT/EHOSTUNREACH 不得判活也不得判无",
+      _op3 == [] and _al3 is False, f"op={_op3} alive={_al3}")
+# M9 结论必须带判据与后续动作
+_rep_c = ls.render({}, {}, [], [], [], "192.168.9.0/24", "now", {})
+check("结论含判据文本与结论后续动作",
+      "首次建账" in _rep_c and "结论后续动作：" in _rep_c, repr(_rep_c[:200]))
+# M7 幽灵段必须声明「只点名、不判离线」
+_rep_g = ls.render({}, {}, [], [], [], "192.168.9.0/24", "now", {},
+                   ghosts=[{"mac": "de:ad:be:ef:00:01", "ip": "192.168.9.77", "streak": 3}])
+check("幽灵段明示「不判定离线」",
+      "不判定离线" in _rep_g and "判定为离线" not in _rep_g)
+_raises2 = False
+try:
+    _wg.guarded_write("wifi_schedule_allowlist", "不在名单", "在名单", "再想想", "在名单")
+except _wg.GuardError:
+    _raises2 = True
+check("三闸守卫拒绝未确认写", _raises2)
+check("写面统一为两类（无第三类）", "**不在允许范围**" in _rctxt)
+check("红线不可豁免（无逃逸条款）",
+      "红线不可豁免" in _skilltxt and "逃逸条款" not in _skilltxt)
+
 print("== render：SSDP 自报但无 ARP 记录的设备不得丢弃 ==")
 _found = {
     "192.168.9.1": {"ip": "192.168.9.1", "mac": "aa:bb:cc:dd:ee:01", "vendor": "",
@@ -224,4 +352,6 @@ if FAILS:
     print(f"结果：{len(FAILS)} 项失败 -> {', '.join(FAILS)}")
     sys.exit(1)
 print("结果：全部通过")
+print("  本脚本为子集，仅覆盖函数级不变量与文档级守卫；")
+print("  Changelog 声明的完整验证请跑：python3 evals/run_all.py")
 sys.exit(0)
