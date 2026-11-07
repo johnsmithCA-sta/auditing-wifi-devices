@@ -53,7 +53,7 @@ MUTATIONS = [
     ("M10 清空三闸文档", "references/router-console.md",
      "## 四、写：三闸制", "## 四、写"),
     ("M11 破坏版本一致性", "scripts/lan_scan.py",
-     '__version__ = "0.4.5"', '__version__ = "9.9.9"'),
+     '__version__ = "0.4.7"', '__version__ = "9.9.9"'),
     ("M12 移除 --check 只读保护", "scripts/fetch_oui.py",
      'if args.check:  # 只读查看，不创建目录',
      'if args.check and False:  # MUTATED'),
@@ -193,7 +193,7 @@ def entity_probe(d, tag, rel):
             if key == "M09":
                 return "结论后续动作" not in m.render({}, {}, [], [], [], "1.2.3.0/24", "t", {})
             if key == "M11":
-                return m.__version__ not in ("0.4.5",)
+                return m.__version__ not in ("0.4.7",)
             if key == "M13":
                 # 移除网段前置校验：非法 --subnet 不再退 2
                 import subprocess as _sp

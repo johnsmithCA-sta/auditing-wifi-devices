@@ -30,7 +30,7 @@ import time
 import urllib.request
 from datetime import datetime
 
-__version__ = "0.4.5"  # 与 SKILL.md frontmatter 同步
+__version__ = "0.4.7"  # 与 SKILL.md frontmatter 同步
 
 # ---------- 工具 ----------
 

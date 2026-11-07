@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""一键回归 runner（0.4.5）。修复前包内只有 smoke_test.py，Changelog 声明
+"""一键回归 runner（0.4.7）。修复前包内只有 smoke_test.py，Changelog 声明
 的「受控写三闸 / 结论 / 幽灵单列 / errno 三档 / --check / --subnet」全部
 没有断言覆盖——检查器报 PASS 但实体改坏仍 PASS（J1 违反）。本 runner 把这些
 声明变成可失败的检查，并给出 0.4.0 放宽召回的「新增召回 + 新增误伤」两个数。
@@ -84,7 +84,7 @@ check("T5 非法 --subnet 退出码 2 且无 traceback",
       p3.returncode == 2 and "Traceback" not in p3.stderr,
       f"rc={p3.returncode}")
 
-print("== 4. 0.4.5 能力落地：Goal 4 / Goal 5 / 幽灵 / RST ==")
+print("== 4. 0.4.7 能力落地：Goal 4 / Goal 5 / 幽灵 / RST ==")
 _found = {
     "192.168.9.1": {"ip": "192.168.9.1", "mac": "aa:bb:cc:dd:ee:01", "vendor": "",
                     "dtype": "未知(随机MAC)", "confidence": "低", "evidence": "x",

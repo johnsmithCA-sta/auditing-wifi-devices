@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""受控写三闸的**代码级强制点**（0.4.5）。
+"""受控写三闸的**代码级强制点**（0.4.7）。
 
 本模块不连接路由器、不操作浏览器。真实写动作由宿主 Agent 在用户已登录的
 后台页面执行；但**任何写动作在动手前必须先过本模块**，否则一律拒绝。
@@ -120,7 +120,7 @@ def audit(plan, readback, *, when=None):
     """闸 3：回读复核 + 留痕。返回可交给用户作回滚依据的变更表行。"""
     if not plan or "target" not in plan:
         raise GuardError("闸3 未过：没有已确认的变更计划")
-    # 防伪造：verify 必须重做闸1/闸2，不能只信 plan 里的字段
+    # 防伪造：verify 须重校操作类型与当前值，并核对签名，不能只信 plan 里的字段
     check_op(plan.get("op", ""))
     if not plan.get("_sig") or plan["_sig"] != _sign(plan):
         raise GuardError("闸3 未过：plan 签名缺失或不符（疑似手写伪造，须经 prepare 产出）")
